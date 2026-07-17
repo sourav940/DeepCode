@@ -3,7 +3,6 @@ import Editor from '@monaco-editor/react';
 import axios from 'axios';
 import { 
   Play, 
-  Terminal, 
   RefreshCw, 
   Layers, 
   Users, 
@@ -17,6 +16,9 @@ import {
   FileCode,
   TerminalSquare
 } from 'lucide-react';
+import { Terminal } from 'xterm';
+import { FitAddon } from 'xterm-addon-fit';
+import 'xterm/css/xterm.css';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
 
@@ -52,11 +54,15 @@ export default function App() {
     { type: 'system', text: 'Initializing DeepCode Workspace...' },
     { type: 'system', text: 'Day 2 System diagnostics running...' }
   ]);
-  const [activeTab, setActiveTab] = useState('terminal'); // 'terminal' | 'problems'
+  const [activeTab, setActiveTab] = useState('output'); // 'terminal' | 'output'
   
   // WebSocket references (Day 1 logic)
-  const terminalWs = useRef(null);
   const collabWs = useRef(null);
+
+  // Refs for xterm (Day 3 logic)
+  const terminalRef = useRef(null);
+  const xtermRef = useRef(null);
+  const terminalWsRef = useRef(null);
 
   // Health check and WebSocket init
   useEffect(() => {
@@ -64,7 +70,6 @@ export default function App() {
     connectWebSockets();
 
     return () => {
-      if (terminalWs.current) terminalWs.current.close();
       if (collabWs.current) collabWs.current.close();
     };
   }, []);
@@ -86,42 +91,7 @@ export default function App() {
   };
 
   const connectWebSockets = () => {
-    // 1. Connect to Terminal WebSocket on path '/terminal'
-    setTerminalStatus('connecting');
-    logToTerminal('system', 'Connecting to Terminal socket path "/terminal"...');
-    
-    const wsTerm = new WebSocket(`${WS_URL}/terminal`);
-    terminalWs.current = wsTerm;
-
-    wsTerm.onopen = () => {
-      setTerminalStatus('connected');
-      logToTerminal('success', 'Terminal WebSocket: Connected successfully.');
-    };
-
-    wsTerm.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data);
-        if (payload.type === 'output') {
-          logToTerminal('output', payload.data);
-        } else {
-          logToTerminal('output', event.data);
-        }
-      } catch (e) {
-        logToTerminal('output', event.data);
-      }
-    };
-
-    wsTerm.onerror = () => {
-      setTerminalStatus('disconnected');
-      logToTerminal('error', 'Terminal WebSocket: Connection error.');
-    };
-
-    wsTerm.onclose = () => {
-      setTerminalStatus('disconnected');
-      logToTerminal('system', 'Terminal WebSocket: Connection closed.');
-    };
-
-    // 2. Connect to Collab WebSocket on path '/collab'
+    // Connect to Collab WebSocket on path '/collab'
     setCollabStatus('connecting');
     logToTerminal('system', 'Connecting to Collab socket path "/collab"...');
     
@@ -152,15 +122,106 @@ export default function App() {
     setTerminalLogs(prev => [...prev, { type, text, timestamp: new Date().toLocaleTimeString() }]);
   };
 
-  // Day 1 Echo Run Code fallback
-  const runCodeWebSocket = () => {
-    logToTerminal('input', `> Running code snippet via /terminal socket...`);
-    if (terminalWs.current && terminalWs.current.readyState === WebSocket.OPEN) {
-      terminalWs.current.send(editorCode);
-    } else {
-      logToTerminal('error', 'Unable to run code: Terminal WebSocket is not connected.');
+  const [reconnectKey, setReconnectKey] = useState(0);
+
+  // Day 3: Separate useEffect for xterm terminal setup
+  useEffect(() => {
+    // Wait for ref to be available
+    if (!terminalRef.current) return;
+    
+    // Prevent double init in React StrictMode
+    if (xtermRef.current) return;
+
+    // Initialize xterm
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily: 'Fira Code, monospace',
+      theme: {
+        background: '#0d0d0d',
+        foreground: '#00ff00',
+        cursor: '#00ff00',
+        selection: 'rgba(0, 255, 0, 0.2)'
+      },
+      scrollback: 1000,
+      convertEol: true
+    });
+
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(terminalRef.current);
+    
+    // Small delay for proper sizing
+    setTimeout(() => fitAddon.fit(), 100);
+    
+    xtermRef.current = term;
+
+    // Connect to backend /terminal WebSocket
+    const wsUrl = `${(import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000')
+      .replace('http', 'ws')}/terminal`;
+    
+    const termWs = new WebSocket(wsUrl);
+    terminalWsRef.current = termWs;
+
+    termWs.onopen = () => {
+      console.log('[xterm] Terminal WebSocket connected');
+      setTerminalStatus('connected');
+      setActiveTab('terminal');
+      term.writeln('\x1b[32mDeepCode Terminal Ready\x1b[0m');
+      term.writeln('\x1b[90mConnected to backend shell...\x1b[0m');
+    };
+
+    // Backend PTY data → xterm display
+    termWs.onmessage = (event) => {
+      term.write(event.data);
+    };
+
+    termWs.onclose = () => {
+      setTerminalStatus('disconnected');
+      term.writeln('\r\n\x1b[31mTerminal disconnected\x1b[0m');
+    };
+
+    termWs.onerror = () => {
+      setTerminalStatus('disconnected');
+    };
+
+    // User typing → backend PTY
+    term.onData((data) => {
+      if (termWs.readyState === WebSocket.OPEN) {
+        termWs.send(data);
+      }
+    });
+
+    // Handle terminal resize
+    term.onResize(({ cols, rows }) => {
+      if (termWs.readyState === WebSocket.OPEN) {
+        termWs.send(JSON.stringify({ type: 'resize', cols, rows }));
+      }
+    });
+
+    // Handle window resize
+    const handleResize = () => {
+      if (fitAddon) fitAddon.fit();
+    };
+    window.addEventListener('resize', handleResize);
+
+    // Cleanup
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      term.dispose();
+      termWs.close();
+      xtermRef.current = null;
+    };
+  }, [terminalRef.current, reconnectKey]);
+
+  // Trigger resize of xterm container when activeTab changes to 'terminal'
+  useEffect(() => {
+    if (activeTab === 'terminal') {
+      setTimeout(() => {
+        window.dispatchEvent(new Event('resize'));
+      }, 100);
     }
-  };
+  }, [activeTab]);
 
   const handleLanguageChange = (newLang) => {
     setLanguage(newLang);
@@ -195,9 +256,9 @@ export default function App() {
 
   const reconnectAll = () => {
     checkHealth();
-    if (terminalWs.current) terminalWs.current.close();
     if (collabWs.current) collabWs.current.close();
     connectWebSockets();
+    setReconnectKey(prev => prev + 1);
   };
 
   return (
@@ -471,23 +532,23 @@ export default function App() {
                     borderBottom: activeTab === 'terminal' ? '2px solid var(--accent-color)' : 'none'
                   }}
                 >
-                  Terminal (ws://)
+                  Terminal
                 </button>
                 <button 
-                  onClick={() => setActiveTab('problems')}
+                  onClick={() => setActiveTab('output')}
                   style={{
                     backgroundColor: 'transparent',
                     border: 'none',
-                    color: activeTab === 'problems' ? 'var(--text-active)' : 'var(--text-secondary)',
-                    fontWeight: activeTab === 'problems' ? 600 : 400,
+                    color: activeTab === 'output' ? 'var(--text-active)' : 'var(--text-secondary)',
+                    fontWeight: activeTab === 'output' ? 600 : 400,
                     fontSize: '12px',
                     cursor: 'pointer',
                     position: 'relative',
                     padding: '0 4px',
-                    borderBottom: activeTab === 'problems' ? '2px solid var(--accent-color)' : 'none'
+                    borderBottom: activeTab === 'output' ? '2px solid var(--accent-color)' : 'none'
                   }}
                 >
-                  Problems
+                  Output
                 </button>
               </div>
 
@@ -548,7 +609,20 @@ export default function App() {
               backgroundColor: '#07090d',
               overflow: 'hidden'
             }}>
-              {activeTab === 'terminal' && (
+              {/* Terminal Tab Container (always mounted for xterm to load) */}
+              <div 
+                ref={terminalRef}
+                style={{
+                  height: '100%',
+                  width: '100%',
+                  backgroundColor: '#0d0d0d',
+                  padding: '4px',
+                  display: activeTab === 'terminal' ? 'block' : 'none'
+                }}
+              />
+
+              {/* Output Tab Container */}
+              {activeTab === 'output' && (
                 <pre style={{
                   fontFamily: 'Fira Code, monospace',
                   color: output.startsWith('❌') ? '#ef4444' : '#10b981',
@@ -560,15 +634,6 @@ export default function App() {
                 }}>
                   {output}
                 </pre>
-              )}
-
-              {activeTab === 'problems' && (
-                <div style={{ padding: '12px', color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--success)' }}>
-                    <CheckCircle2 size={16} />
-                    <span>No errors or warnings detected in workspace! Day 2 builds clean.</span>
-                  </div>
-                </div>
               )}
             </div>
           </div>
