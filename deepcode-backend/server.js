@@ -10,6 +10,14 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
+const pty = require('node-pty');
+const os = require('os');
+
+const shell = os.platform() === 'win32' 
+  ? 'powershell.exe' 
+  : 'bash';
+
+
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -205,22 +213,59 @@ const wssTerminal = new ws.Server({ noServer: true });
 const wssYjs = new ws.Server({ noServer: true });
 
 // Set up Terminal socket event handlers
-wssTerminal.on('connection', (wsConnection) => {
-  console.log('[WebSocket] Terminal client connected.');
+wssTerminal.on('connection', (ws) => {
+  console.log('[Terminal] Client connected, spawning PTY...');
   
-  wsConnection.on('message', (message) => {
-    const messageString = message.toString();
-    console.log(`[WebSocket] Terminal message received: ${messageString}`);
-    // Simulate terminal execution output response
-    const echoResponse = JSON.stringify({
-      type: 'output',
-      data: `[Terminal Output] Code executed successfully!\nResult of run:\n${messageString}\n`
-    });
-    wsConnection.send(echoResponse);
+  // Spawn PTY process
+  const ptyProcess = pty.spawn(shell, [], {
+    name: 'xterm-color',
+    cols: 80,
+    rows: 24,
+    cwd: process.env.HOME || process.cwd(),
+    env: process.env
   });
 
-  wsConnection.on('close', () => {
-    console.log('[WebSocket] Terminal client disconnected.');
+  console.log(`[Terminal] PTY spawned: PID ${ptyProcess.pid}`);
+
+  // PTY output → WebSocket → browser
+  ptyProcess.onData((data) => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(data);
+    }
+  });
+
+  // Browser keystrokes → WebSocket → PTY
+  ws.on('message', (message) => {
+    try {
+      // Check if resize event
+      const parsed = JSON.parse(message.toString());
+      if (parsed.type === 'resize') {
+        ptyProcess.resize(
+          Math.max(1, parsed.cols),
+          Math.max(1, parsed.rows)
+        );
+        console.log(`[Terminal] Resized to ${parsed.cols}x${parsed.rows}`);
+        return;
+      }
+    } catch {
+      // Not JSON — raw keystroke, write directly to PTY
+    }
+    ptyProcess.write(message.toString());
+  });
+
+  // Cleanup on disconnect
+  ws.on('close', () => {
+    console.log('[Terminal] Client disconnected, killing PTY...');
+    try {
+      ptyProcess.kill();
+    } catch (e) {
+      console.error('[Terminal] PTY kill error:', e.message);
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error('[Terminal] WebSocket error:', err.message);
+    try { ptyProcess.kill(); } catch(e) {}
   });
 });
 
