@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
 import { 
@@ -54,15 +54,26 @@ export default function App() {
     { type: 'system', text: 'Initializing DeepCode Workspace...' },
     { type: 'system', text: 'Day 2 System diagnostics running...' }
   ]);
-  const [activeTab, setActiveTab] = useState('output'); // 'terminal' | 'output'
+  const [rightTab, setRightTab] = useState('terminal'); // 'terminal' | 'output'
   
+  // Multi-terminal state
+  const [terminals, setTerminals] = useState([
+    { id: 'term-1', name: 'Terminal 1' }
+  ]);
+  const [activeTerminalId, setActiveTerminalId] = useState('term-1');
+
   // WebSocket references (Day 1 logic)
   const collabWs = useRef(null);
 
-  // Refs for xterm (Day 3 logic)
-  const terminalRef = useRef(null);
-  const xtermRef = useRef(null);
-  const terminalWsRef = useRef(null);
+  // Per-instance refs map:
+  // terminalInstancesRef.current[termId] = {
+  //   xterm: Terminal,
+  //   fitAddon: FitAddon,
+  //   ws: WebSocket,
+  //   container: div DOM ref
+  // }
+  const terminalInstancesRef = useRef({});
+  const terminalContainersRef = useRef({});
 
   // Health check and WebSocket init
   useEffect(() => {
@@ -122,17 +133,13 @@ export default function App() {
     setTerminalLogs(prev => [...prev, { type, text, timestamp: new Date().toLocaleTimeString() }]);
   };
 
-  const [reconnectKey, setReconnectKey] = useState(0);
-
-  // Day 3: Separate useEffect for xterm terminal setup
-  useEffect(() => {
-    // Wait for ref to be available
-    if (!terminalRef.current) return;
+  const initTerminal = useCallback((termId) => {
+    // Prevent double init
+    if (terminalInstancesRef.current[termId]?.xterm) return;
     
-    // Prevent double init in React StrictMode
-    if (xtermRef.current) return;
+    const container = terminalContainersRef.current[termId];
+    if (!container) return;
 
-    // Initialize xterm
     const term = new Terminal({
       cursorBlink: true,
       fontSize: 13,
@@ -141,7 +148,6 @@ export default function App() {
         background: '#0d0d0d',
         foreground: '#00ff00',
         cursor: '#00ff00',
-        selection: 'rgba(0, 255, 0, 0.2)'
       },
       scrollback: 1000,
       convertEol: true
@@ -149,79 +155,91 @@ export default function App() {
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    term.open(terminalRef.current);
-    
-    // Small delay for proper sizing
+    term.open(container);
     setTimeout(() => fitAddon.fit(), 100);
-    
-    xtermRef.current = term;
 
-    // Connect to backend /terminal WebSocket
-    const wsUrl = `${(import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000')
-      .replace('http', 'ws')}/terminal`;
-    
-    const termWs = new WebSocket(wsUrl);
-    terminalWsRef.current = termWs;
+    // WebSocket with sessionId
+    const backendUrl = import.meta.env.VITE_BACKEND_URL 
+      || 'http://localhost:3000';
+    const wsUrl = `${backendUrl.replace('http', 'ws')}/terminal?sessionId=${termId}`;
+    const ws = new WebSocket(wsUrl);
 
-    termWs.onopen = () => {
-      console.log('[xterm] Terminal WebSocket connected');
+    ws.onopen = () => {
       setTerminalStatus('connected');
-      setActiveTab('terminal');
       term.writeln('\x1b[32mDeepCode Terminal Ready\x1b[0m');
-      term.writeln('\x1b[90mConnected to backend shell...\x1b[0m');
     };
 
-    // Backend PTY data → xterm display
-    termWs.onmessage = (event) => {
+    ws.onmessage = (event) => {
       term.write(event.data);
     };
 
-    termWs.onclose = () => {
-      setTerminalStatus('disconnected');
-      term.writeln('\r\n\x1b[31mTerminal disconnected\x1b[0m');
+    ws.onclose = () => {
+      term.writeln('\r\n\x1b[31mDisconnected\x1b[0m');
+      if (Object.keys(terminalInstancesRef.current).length === 1) {
+        setTerminalStatus('disconnected');
+      }
     };
 
-    termWs.onerror = () => {
-      setTerminalStatus('disconnected');
-    };
-
-    // User typing → backend PTY
     term.onData((data) => {
-      if (termWs.readyState === WebSocket.OPEN) {
-        termWs.send(data);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(data);
       }
     });
 
-    // Handle terminal resize
     term.onResize(({ cols, rows }) => {
-      if (termWs.readyState === WebSocket.OPEN) {
-        termWs.send(JSON.stringify({ type: 'resize', cols, rows }));
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'resize', cols, rows }));
       }
     });
 
-    // Handle window resize
-    const handleResize = () => {
-      if (fitAddon) fitAddon.fit();
-    };
+    const handleResize = () => fitAddon.fit();
     window.addEventListener('resize', handleResize);
 
-    // Cleanup
-    return () => {
-      window.removeEventListener('resize', handleResize);
-      term.dispose();
-      termWs.close();
-      xtermRef.current = null;
+    // Store instance
+    terminalInstancesRef.current[termId] = {
+      xterm: term,
+      fitAddon,
+      ws,
+      handleResize
     };
-  }, [terminalRef.current, reconnectKey]);
+  }, []);
 
-  // Trigger resize of xterm container when activeTab changes to 'terminal'
   useEffect(() => {
-    if (activeTab === 'terminal') {
-      setTimeout(() => {
-        window.dispatchEvent(new Event('resize'));
-      }, 100);
-    }
-  }, [activeTab]);
+    // Small delay for DOM to render
+    const timer = setTimeout(() => {
+      initTerminal('term-1');
+    }, 200);
+    
+    return () => {
+      clearTimeout(timer);
+      // Cleanup all terminals
+      Object.entries(terminalInstancesRef.current).forEach(([id, instance]) => {
+        instance.xterm?.dispose();
+        instance.ws?.close();
+        window.removeEventListener('resize', instance.handleResize);
+      });
+      terminalInstancesRef.current = {};
+    };
+  }, []);
+
+  const addTerminal = () => {
+    const newId = `term-${Date.now()}`;
+    const newName = `Terminal ${terminals.length + 1}`;
+    
+    setTerminals(prev => [...prev, { id: newId, name: newName }]);
+    setActiveTerminalId(newId);
+    
+    // Init after DOM renders new container
+    setTimeout(() => initTerminal(newId), 100);
+  };
+
+  const switchTerminal = (termId) => {
+    setActiveTerminalId(termId);
+    // Fit after becoming visible
+    setTimeout(() => {
+      terminalInstancesRef.current[termId]?.fitAddon?.fit();
+    }, 50);
+  };
 
   const handleLanguageChange = (newLang) => {
     setLanguage(newLang);
@@ -505,132 +523,125 @@ export default function App() {
             flexDirection: 'column', 
             backgroundColor: 'var(--bg-panel)' 
           }}>
-            
-            {/* Terminal Actions Bar */}
-            <div style={{
-              height: '35px',
-              backgroundColor: 'var(--bg-sidebar)',
-              borderBottom: '1px solid var(--border-color)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              padding: '0 12px',
-              userSelect: 'none'
-            }}>
-              <div style={{ display: 'flex', gap: '16px', height: '100%' }}>
-                <button 
-                  onClick={() => setActiveTab('terminal')}
-                  style={{
+            <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+              
+              {/* Tab bar */}
+              <div style={{ display: 'flex', alignItems: 'center', 
+                            borderBottom: '1px solid #1e2433',
+                            backgroundColor: '#07090c' }}>
+                
+                {/* Main tabs: Terminal | Output */}
+                <button onClick={() => setRightTab('terminal')}
+                  style={{ 
                     backgroundColor: 'transparent',
                     border: 'none',
-                    color: activeTab === 'terminal' ? 'var(--text-active)' : 'var(--text-secondary)',
-                    fontWeight: activeTab === 'terminal' ? 600 : 400,
-                    fontSize: '12px',
+                    padding: '8px 12px',
                     cursor: 'pointer',
-                    position: 'relative',
-                    padding: '0 4px',
-                    borderBottom: activeTab === 'terminal' ? '2px solid var(--accent-color)' : 'none'
-                  }}
-                >
+                    fontWeight: rightTab === 'terminal' ? 'bold' : 'normal',
+                    color: rightTab==='terminal' ? '#6366f1' : '#64748b' 
+                  }}>
                   Terminal
                 </button>
-                <button 
-                  onClick={() => setActiveTab('output')}
-                  style={{
+                <button onClick={() => setRightTab('output')}
+                  style={{ 
                     backgroundColor: 'transparent',
                     border: 'none',
-                    color: activeTab === 'output' ? 'var(--text-active)' : 'var(--text-secondary)',
-                    fontWeight: activeTab === 'output' ? 600 : 400,
-                    fontSize: '12px',
+                    padding: '8px 12px',
                     cursor: 'pointer',
-                    position: 'relative',
-                    padding: '0 4px',
-                    borderBottom: activeTab === 'output' ? '2px solid var(--accent-color)' : 'none'
-                  }}
-                >
+                    fontWeight: rightTab === 'output' ? 'bold' : 'normal',
+                    color: rightTab==='output' ? '#6366f1' : '#64748b' 
+                  }}>
                   Output
                 </button>
-              </div>
-
-              {/* Action Buttons */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <button
-                  onClick={clearConsole}
-                  style={{
-                    backgroundColor: 'transparent',
-                    border: '1px solid var(--border-color)',
-                    color: 'var(--text-secondary)',
-                    fontSize: '11px',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                    cursor: 'pointer'
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.color = 'var(--text-primary)'}
-                  onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-secondary)'}
-                >
-                  Clear Console
-                </button>
                 
+                {/* Terminal instance tabs (only when Terminal tab active) */}
+                {rightTab === 'terminal' && (
+                  <>
+                    {terminals.map(term => (
+                      <button
+                        key={term.id}
+                        onClick={() => switchTerminal(term.id)}
+                        style={{
+                          backgroundColor: activeTerminalId === term.id ? '#1e2433' : 'transparent',
+                          border: '1px solid #1e2433',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          color: activeTerminalId === term.id ? '#10b981' : '#64748b',
+                          fontSize: '11px',
+                          padding: '2px 8px',
+                          marginRight: '4px'
+                        }}>
+                        {term.name}
+                      </button>
+                    ))}
+                    {/* Add new terminal button */}
+                    <button
+                      onClick={addTerminal}
+                      title="New Terminal"
+                      style={{ 
+                        backgroundColor: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        color: '#6366f1', 
+                        fontWeight: 'bold',
+                        padding: '2px 8px' 
+                      }}>
+                      +
+                    </button>
+                  </>
+                )}
+                
+                {/* Run Code button — right side */}
                 <button
                   onClick={handleRunCode}
                   disabled={isRunning}
-                  className="btn-run"
-                  style={{
-                    backgroundColor: 'var(--success)',
-                    color: '#fff',
+                  style={{ 
+                    marginLeft: 'auto',
+                    backgroundColor: '#10b981',
+                    color: 'white',
                     border: 'none',
+                    borderRadius: '4px',
+                    padding: '4px 10px',
                     fontSize: '11px',
                     fontWeight: 'bold',
-                    padding: '4px 10px',
-                    borderRadius: '4px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '4px',
                     cursor: isRunning ? 'not-allowed' : 'pointer',
-                    boxShadow: '0 2px 4px rgba(16, 185, 129, 0.2)',
-                    opacity: isRunning ? 0.6 : 1
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!isRunning) e.currentTarget.style.backgroundColor = 'var(--success-hover)';
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isRunning) e.currentTarget.style.backgroundColor = 'var(--success)';
-                  }}
-                >
-                  <Play size={12} fill="#fff" />
-                  <span>{isRunning ? '⏳ Running...' : '▶ Run Code'}</span>
+                    opacity: isRunning ? 0.6 : 1,
+                    marginRight: '8px'
+                  }}>
+                  {isRunning ? '⏳ Running...' : '▶ Run Code'}
                 </button>
               </div>
-            </div>
 
-            {/* Terminal Console Windows */}
-            <div style={{
-              flex: 1,
-              backgroundColor: '#07090d',
-              overflow: 'hidden'
-            }}>
-              {/* Terminal Tab Container (always mounted for xterm to load) */}
-              <div 
-                ref={terminalRef}
-                style={{
-                  height: '100%',
-                  width: '100%',
-                  backgroundColor: '#0d0d0d',
-                  padding: '4px',
-                  display: activeTab === 'terminal' ? 'block' : 'none'
-                }}
-              />
+              {/* Terminal containers — ALL mounted, toggle visibility */}
+              <div style={{ 
+                flex: 1, 
+                display: rightTab === 'terminal' ? 'block' : 'none',
+                position: 'relative' 
+              }}>
+                {terminals.map(term => (
+                  <div
+                    key={term.id}
+                    ref={el => terminalContainersRef.current[term.id] = el}
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      display: activeTerminalId === term.id ? 'block' : 'none',
+                      backgroundColor: '#0d0d0d'
+                    }}
+                  />
+                ))}
+              </div>
 
-              {/* Output Tab Container */}
-              {activeTab === 'output' && (
+              {/* Output tab */}
+              {rightTab === 'output' && (
                 <pre style={{
+                  flex: 1,
                   fontFamily: 'Fira Code, monospace',
                   color: output.startsWith('❌') ? '#ef4444' : '#10b981',
                   whiteSpace: 'pre-wrap',
                   padding: '12px',
-                  margin: 0,
-                  height: '100%',
-                  overflow: 'auto'
+                  overflow: 'auto',
+                  margin: 0
                 }}>
                   {output}
                 </pre>
