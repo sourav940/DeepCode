@@ -12,10 +12,51 @@ require('dotenv').config();
 
 const pty = require('node-pty');
 const os = require('os');
+const { ESLint } = require('eslint');
 
 const shell = os.platform() === 'win32' 
   ? 'powershell.exe' 
   : 'bash';
+
+// Initialize ESLint instance (global reusable instance)
+const eslintInstance = new ESLint({
+  useEslintrc: false,
+  overrideConfig: {
+    env: {
+      es2022: true,
+      browser: true,
+      node: true
+    },
+    parserOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module'
+    },
+    rules: {
+      // Beginner mistakes
+      'no-unused-vars': 'warn',
+      'no-undef': 'error',
+      'eqeqeq': 'warn',
+      'no-var': 'warn',
+      'no-empty': 'warn',
+      
+      // Infinite loop detection
+      'no-constant-condition': 'error',
+      
+      // Dead code
+      'no-unreachable': 'error',
+      
+      // Security vulnerabilities
+      'no-eval': 'error',
+      'no-implied-eval': 'error',
+      'no-new-func': 'error',
+      
+      // Code quality
+      'no-duplicate-case': 'error',
+      'no-self-assign': 'warn',
+      'no-useless-return': 'warn'
+    }
+  }
+});
 
 
 const app = express();
@@ -188,6 +229,46 @@ app.post('/api/execute', async (req, res) => {
   }
 });
 
+// POST /api/lint route
+app.post('/api/lint', async (req, res) => {
+  const { code, language } = req.body;
+
+  // Empty code check
+  if (!code || !code.trim()) {
+    return res.json([]);
+  }
+
+  // Only lint JavaScript — Python/C++ return empty
+  if (language && language !== 'javascript') {
+    return res.json([]);
+  }
+
+  try {
+    const results = await eslintInstance.lintText(code);
+    const messages = results[0]?.messages || [];
+
+    const diagnostics = messages.map(msg => ({
+      line: msg.line,
+      column: msg.column,
+      severity: msg.severity,    // 1=warning, 2=error
+      message: msg.message,
+      ruleId: msg.ruleId         // which rule fired
+    }));
+
+    res.json(diagnostics);
+
+  } catch (error) {
+    // Parse error (invalid JS syntax) — return as diagnostic
+    res.json([{
+      line: 1,
+      column: 1,
+      severity: 2,
+      message: `Parse error: ${error.message}`,
+      ruleId: 'parse-error'
+    }]);
+  }
+});
+
 // Wrap Express app with native HTTP server
 const server = http.createServer(app);
 
@@ -208,64 +289,115 @@ io.on('connection', (socket) => {
   });
 });
 
-// Instantiate two separate ws.Server instances with noServer: true
+const activeTerminalSessions = {};
+// Structure per entry:
+// activeTerminalSessions[sessionId] = {
+//   ptyProcess: pty instance,
+//   cleanupTimer: setTimeout reference | null
+// }
+
 const wssTerminal = new ws.Server({ noServer: true });
 const wssYjs = new ws.Server({ noServer: true });
 
 // Set up Terminal socket event handlers
-wssTerminal.on('connection', (ws) => {
-  console.log('[Terminal] Client connected, spawning PTY...');
-  
-  // Spawn PTY process
-  const ptyProcess = pty.spawn(shell, [], {
-    name: 'xterm-color',
-    cols: 80,
-    rows: 24,
-    cwd: process.env.HOME || process.cwd(),
-    env: process.env
-  });
+wssTerminal.on('connection', (ws, request) => {
+  // Extract sessionId from URL query params
+  const urlParams = new URL(
+    request.url, 
+    `http://${request.headers.host}`
+  );
+  const sessionId = urlParams.searchParams.get('sessionId') 
+    || `session_${Date.now()}`;
 
-  console.log(`[Terminal] PTY spawned: PID ${ptyProcess.pid}`);
+  console.log(`[Terminal] Connection for session: ${sessionId}`);
 
-  // PTY output → WebSocket → browser
+  let ptyProcess;
+
+  if (activeTerminalSessions[sessionId]) {
+    // RECONNECT PATH — existing session resume karo
+    const session = activeTerminalSessions[sessionId];
+    
+    // Cancel pending cleanup timer
+    if (session.cleanupTimer) {
+      clearTimeout(session.cleanupTimer);
+      session.cleanupTimer = null;
+      console.log(`[Terminal] Cancelled cleanup for: ${sessionId}`);
+    }
+    
+    ptyProcess = session.ptyProcess;
+    
+    // Remove old listeners to prevent memory leak
+    ptyProcess.removeAllListeners('data');
+    
+    console.log(`[Terminal] Resumed session: ${sessionId}`);
+    
+    // Notify client of reconnection
+    if (ws.readyState === ws.OPEN) {
+      ws.send('\r\n\x1b[33m[Session Resumed]\x1b[0m\r\n');
+    }
+    
+  } else {
+    // NEW SESSION PATH — fresh PTY spawn karo
+    ptyProcess = pty.spawn(shell, [], {
+      name: 'xterm-color',
+      cols: 80,
+      rows: 24,
+      cwd: process.env.HOME || process.cwd(),
+      env: process.env
+    });
+    
+    activeTerminalSessions[sessionId] = {
+      ptyProcess,
+      cleanupTimer: null
+    };
+    
+    console.log(`[Terminal] New session: ${sessionId}, PID: ${ptyProcess.pid}`);
+  }
+
+  // PTY output → WebSocket (both new and resumed)
   ptyProcess.onData((data) => {
     if (ws.readyState === ws.OPEN) {
       ws.send(data);
     }
   });
 
-  // Browser keystrokes → WebSocket → PTY
+  // WebSocket messages → PTY
   ws.on('message', (message) => {
     try {
-      // Check if resize event
       const parsed = JSON.parse(message.toString());
       if (parsed.type === 'resize') {
         ptyProcess.resize(
           Math.max(1, parsed.cols),
           Math.max(1, parsed.rows)
         );
-        console.log(`[Terminal] Resized to ${parsed.cols}x${parsed.rows}`);
         return;
       }
     } catch {
-      // Not JSON — raw keystroke, write directly to PTY
+      // Raw keystroke
     }
     ptyProcess.write(message.toString());
   });
 
-  // Cleanup on disconnect
+  // Disconnect handler — delayed cleanup
   ws.on('close', () => {
-    console.log('[Terminal] Client disconnected, killing PTY...');
-    try {
-      ptyProcess.kill();
-    } catch (e) {
-      console.error('[Terminal] PTY kill error:', e.message);
+    console.log(`[Terminal] WS closed for: ${sessionId}`);
+    
+    if (activeTerminalSessions[sessionId]) {
+      // 2 minute grace period for reconnect
+      activeTerminalSessions[sessionId].cleanupTimer = setTimeout(() => {
+        console.log(`[Terminal] Cleaning up session: ${sessionId}`);
+        try {
+          activeTerminalSessions[sessionId].ptyProcess.kill();
+        } catch(e) {}
+        delete activeTerminalSessions[sessionId];
+      }, 120000);
     }
   });
 
   ws.on('error', (err) => {
-    console.error('[Terminal] WebSocket error:', err.message);
+    console.error(`[Terminal] WS error for ${sessionId}:`, err.message);
     try { ptyProcess.kill(); } catch(e) {}
+    delete activeTerminalSessions[sessionId];
   });
 });
 
