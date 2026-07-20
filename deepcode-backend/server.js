@@ -14,6 +14,13 @@ const pty = require('node-pty');
 const os = require('os');
 const { ESLint } = require('eslint');
 
+let setupWSConnection;
+try {
+  setupWSConnection = require('y-websocket/bin/utils').setupWSConnection;
+} catch(e) {
+  setupWSConnection = require('y-websocket').setupWSConnection;
+}
+
 const shell = os.platform() === 'win32' 
   ? 'powershell.exe' 
   : 'bash';
@@ -404,18 +411,30 @@ wssTerminal.on('connection', (ws, request) => {
 });
 
 // Set up Collaboration socket event handlers
-wssYjs.on('connection', (wsConnection) => {
-  console.log('[WebSocket] Collab client connected.');
-  
-  wsConnection.on('message', (message) => {
-    const messageString = message.toString();
-    console.log(`[WebSocket] Collab sync event: ${messageString}`);
-    wsConnection.send(`[Collab Sync Echo] Received: ${messageString}`);
-  });
+wssYjs.on('connection', (ws, request) => {
+  try {
+    // Extract room ID from URL query params
+    // Frontend sends: ws://localhost:3000/collab?room=roomId
+    const urlParams = new URL(
+      request.url,
+      `http://${request.headers.host}`
+    );
+    const roomId = urlParams.searchParams.get('room') 
+      || 'deepcode-default-room';
 
-  wsConnection.on('close', () => {
-    console.log('[WebSocket] Collab client disconnected.');
-  });
+    console.log(`[Collab] Client connected to room: ${roomId}`);
+
+    // setupWSConnection handles ALL Yjs sync automatically
+    // It manages document state, awareness, and sync messages
+    setupWSConnection(ws, request, {
+      docName: roomId,
+      gc: true  // garbage collect unused docs from memory
+    });
+
+  } catch (error) {
+    console.error('[Collab] setupWSConnection error:', error.message);
+    ws.close();
+  }
 });
 
 // Implement path-based protocol upgrades
