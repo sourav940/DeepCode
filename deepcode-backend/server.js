@@ -250,6 +250,8 @@ app.post('/api/lint', async (req, res) => {
     const diagnostics = messages.map(msg => ({
       line: msg.line,
       column: msg.column,
+      endLine: msg.endLine,
+      endColumn: msg.endColumn,
       severity: msg.severity,    // 1=warning, 2=error
       message: msg.message,
       ruleId: msg.ruleId         // which rule fired
