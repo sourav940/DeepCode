@@ -65,6 +65,17 @@ export default function App() {
   // WebSocket references (Day 1 logic)
   const collabWs = useRef(null);
 
+  const editorRef = useRef(null);
+  const monacoRef = useRef(null);
+  const debounceTimer = useRef(null);
+  const activeLangRef = useRef(language);
+
+  useEffect(() => {
+    activeLangRef.current = language;
+  }, [language]);
+
+  const [diagnostics, setDiagnostics] = useState([]);
+
   // Per-instance refs map:
   // terminalInstancesRef.current[termId] = {
   //   xterm: Terminal,
@@ -82,6 +93,7 @@ export default function App() {
 
     return () => {
       if (collabWs.current) collabWs.current.close();
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
     };
   }, []);
 
@@ -245,6 +257,14 @@ export default function App() {
     setLanguage(newLang);
     setEditorCode(DEFAULT_CODE[newLang]);
     setOutput('// Output will appear here...');
+    
+    setDiagnostics([]);
+    if (editorRef.current && monacoRef.current) {
+      const model = editorRef.current.getModel();
+      if (model) {
+        monacoRef.current.editor.setModelMarkers(model, 'eslint', []);
+      }
+    }
   };
 
   const handleRunCode = async () => {
@@ -277,6 +297,73 @@ export default function App() {
     if (collabWs.current) collabWs.current.close();
     connectWebSockets();
     setReconnectKey(prev => prev + 1);
+  };
+
+  const handleEditorDidMount = (editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
+  };
+
+  const runLint = useCallback(async (code, lang) => {
+    if (lang !== 'javascript') {
+      if (editorRef.current && monacoRef.current) {
+        monacoRef.current.editor.setModelMarkers(
+          editorRef.current.getModel(), 'eslint', []
+        );
+      }
+      setDiagnostics([]);
+      return;
+    }
+
+    try {
+      const response = await axios.post(
+        `${import.meta.env.VITE_BACKEND_URL || 
+          'http://localhost:3000'}/api/lint`,
+        { code, language: lang }
+      );
+
+      if (lang !== activeLangRef.current) return;
+
+      const results = response.data;
+      setDiagnostics(results);
+
+      if (editorRef.current && monacoRef.current) {
+        const model = editorRef.current.getModel();
+        if (!model) return;
+
+        const monaco = monacoRef.current;
+        const markers = results.map(d => ({
+          startLineNumber: d.line,
+          startColumn: d.column,
+          endLineNumber: d.endLine || d.line,
+          endColumn: d.endColumn || Number.MAX_SAFE_INTEGER,
+          message: `${d.message} (${d.ruleId})`,
+          severity: d.severity === 2
+            ? monaco.MarkerSeverity.Error
+            : monaco.MarkerSeverity.Warning
+        }));
+
+        monaco.editor.setModelMarkers(
+          model,
+          'eslint',
+          markers
+        );
+      }
+    } catch (err) {
+      console.error('[Lint]', err.message);
+    }
+  }, []);
+
+  const handleEditorChange = (value) => {
+    const newCode = value || '';
+    setEditorCode(newCode);
+
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+    }
+    debounceTimer.current = setTimeout(() => {
+      runLint(newCode, language);
+    }, 500);
   };
 
   return (
@@ -499,18 +586,15 @@ export default function App() {
                 height="100%"
                 language={language}
                 value={editorCode}
-                onChange={(value) => setEditorCode(value || '')}
+                onChange={handleEditorChange}
+                onMount={handleEditorDidMount}
                 theme="vs-dark"
                 options={{
-                  minimap: { enabled: false },
                   fontSize: 14,
-                  fontFamily: 'Fira Code',
-                  lineNumbers: 'on',
-                  automaticLayout: true,
-                  scrollbar: {
-                    verticalScrollbarSize: 8,
-                    horizontalScrollbarSize: 8,
-                  },
+                  fontFamily: 'Fira Code, monospace',
+                  minimap: { enabled: false },
+                  scrollBeyondLastLine: false,
+                  automaticLayout: true
                 }}
               />
             </div>
@@ -552,6 +636,18 @@ export default function App() {
                     color: rightTab==='output' ? '#6366f1' : '#64748b' 
                   }}>
                   Output
+                </button>
+                <button onClick={() => setRightTab('problems')}
+                  style={{ 
+                    backgroundColor: 'transparent',
+                    border: 'none',
+                    padding: '8px 12px',
+                    cursor: 'pointer',
+                    fontWeight: rightTab === 'problems' ? 'bold' : 'normal',
+                    color: rightTab==='problems' ? '#6366f1' : '#64748b'
+                  }}>
+                  Problems {diagnostics.length > 0 
+                    ? `(${diagnostics.length})` : ''}
                 </button>
                 
                 {/* Terminal instance tabs (only when Terminal tab active) */}
@@ -645,6 +741,62 @@ export default function App() {
                 }}>
                   {output}
                 </pre>
+              )}
+
+              {/* Problems tab content */}
+              {rightTab === 'problems' && (
+                <div style={{
+                  height: '100%',
+                  overflow: 'auto',
+                  padding: '8px',
+                  fontFamily: 'Fira Code, monospace',
+                  fontSize: '12px'
+                }}>
+                  {diagnostics.length === 0 ? (
+                    <div style={{ color: '#10b981', padding: '8px' }}>
+                      ✅ No issues found
+                    </div>
+                  ) : (
+                    diagnostics.map((d, i) => (
+                      <div
+                        key={i}
+                        onClick={() => {
+                          editorRef.current?.revealLineInCenter(d.line);
+                          editorRef.current?.setPosition({
+                            lineNumber: d.line,
+                            column: d.column
+                          });
+                        }}
+                        style={{
+                          display: 'flex',
+                          gap: '8px',
+                          padding: '4px 8px',
+                          marginBottom: '2px',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          backgroundColor: 'rgba(255,255,255,0.03)',
+                          borderLeft: `3px solid ${
+                            d.severity === 2 ? '#ef4444' : '#f59e0b'
+                          }`
+                        }}
+                      >
+                        <span style={{
+                          color: d.severity === 2 ? '#ef4444' : '#f59e0b',
+                          minWidth: '55px',
+                          fontSize: '11px'
+                        }}>
+                          {d.severity === 2 ? '● Error' : '⚠ Warn'}
+                        </span>
+                        <span style={{ color: '#cbd5e1', flex: 1 }}>
+                          {d.message}
+                        </span>
+                        <span style={{ color: '#475569', fontSize: '11px' }}>
+                          Ln {d.line}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
               )}
             </div>
           </div>
