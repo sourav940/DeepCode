@@ -1,16 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
-import { 
-  Play, 
-  RefreshCw, 
-  Layers, 
-  Users, 
-  FolderTree, 
-  Search, 
-  Settings, 
-  HelpCircle, 
-  CheckCircle2, 
+import {
+  Play,
+  RefreshCw,
+  Layers,
+  Users,
+  FolderTree,
+  Search,
+  Settings,
+  HelpCircle,
+  CheckCircle2,
   XCircle,
   Code2,
   FileCode,
@@ -19,6 +19,9 @@ import {
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import 'xterm/css/xterm.css';
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
+import { MonacoBinding } from 'y-monaco';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
 
@@ -44,18 +47,18 @@ export default function App() {
   const [output, setOutput] = useState('// Output will appear here...');
   const [isRunning, setIsRunning] = useState(false);
   const [editorCode, setEditorCode] = useState(DEFAULT_CODE.python);
-  
+
   // Connection states (Day 1 logic)
   const [apiStatus, setApiStatus] = useState('connecting'); // 'connected' | 'disconnected' | 'connecting'
   const [terminalStatus, setTerminalStatus] = useState('connecting');
   const [collabStatus, setCollabStatus] = useState('connecting');
-  
+
   const [terminalLogs, setTerminalLogs] = useState([
     { type: 'system', text: 'Initializing DeepCode Workspace...' },
     { type: 'system', text: 'Day 2 System diagnostics running...' }
   ]);
   const [rightTab, setRightTab] = useState('terminal'); // 'terminal' | 'output'
-  
+
   // Multi-terminal state
   const [terminals, setTerminals] = useState([
     { id: 'term-1', name: 'Terminal 1' }
@@ -69,6 +72,15 @@ export default function App() {
   const monacoRef = useRef(null);
   const debounceTimer = useRef(null);
   const activeLangRef = useRef(language);
+
+  // Collab state & refs
+  const [collabEnabled, setCollabEnabled] = useState(false);
+  const [roomId, setRoomId] = useState('');
+  const [collabUsers, setCollabUsers] = useState(0);
+
+  const ydocRef = useRef(null);
+  const yjsProviderRef = useRef(null);
+  const monacoBindingRef = useRef(null);
 
   useEffect(() => {
     activeLangRef.current = language;
@@ -94,6 +106,9 @@ export default function App() {
     return () => {
       if (collabWs.current) collabWs.current.close();
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      if (monacoBindingRef.current) monacoBindingRef.current.destroy();
+      if (yjsProviderRef.current) yjsProviderRef.current.destroy();
+      if (ydocRef.current) ydocRef.current.destroy();
     };
   }, []);
 
@@ -114,11 +129,11 @@ export default function App() {
   };
 
   const connectWebSockets = () => {
-    // Connect to Collab WebSocket on path '/collab'
+    // Connect to Collab WebSocket on path '/status'
     setCollabStatus('connecting');
-    logToTerminal('system', 'Connecting to Collab socket path "/collab"...');
+    logToTerminal('system', 'Connecting to Collab socket path "/status"...');
     
-    const wsCollab = new WebSocket(`${WS_URL}/collab`);
+    const wsCollab = new WebSocket(`${WS_URL}/status`);
     collabWs.current = wsCollab;
 
     wsCollab.onopen = () => {
@@ -148,7 +163,7 @@ export default function App() {
   const initTerminal = useCallback((termId) => {
     // Prevent double init
     if (terminalInstancesRef.current[termId]?.xterm) return;
-    
+
     const container = terminalContainersRef.current[termId];
     if (!container) return;
 
@@ -171,7 +186,7 @@ export default function App() {
     setTimeout(() => fitAddon.fit(), 100);
 
     // WebSocket with sessionId
-    const backendUrl = import.meta.env.VITE_BACKEND_URL 
+    const backendUrl = import.meta.env.VITE_BACKEND_URL
       || 'http://localhost:3000';
     const wsUrl = `${backendUrl.replace('http', 'ws')}/terminal?sessionId=${termId}`;
     const ws = new WebSocket(wsUrl);
@@ -221,7 +236,7 @@ export default function App() {
     const timer = setTimeout(() => {
       initTerminal('term-1');
     }, 200);
-    
+
     return () => {
       clearTimeout(timer);
       // Cleanup all terminals
@@ -237,10 +252,10 @@ export default function App() {
   const addTerminal = () => {
     const newId = `term-${Date.now()}`;
     const newName = `Terminal ${terminals.length + 1}`;
-    
+
     setTerminals(prev => [...prev, { id: newId, name: newName }]);
     setActiveTerminalId(newId);
-    
+
     // Init after DOM renders new container
     setTimeout(() => initTerminal(newId), 100);
   };
@@ -257,7 +272,7 @@ export default function App() {
     setLanguage(newLang);
     setEditorCode(DEFAULT_CODE[newLang]);
     setOutput('// Output will appear here...');
-    
+
     setDiagnostics([]);
     if (editorRef.current && monacoRef.current) {
       const model = editorRef.current.getModel();
@@ -317,8 +332,8 @@ export default function App() {
 
     try {
       const response = await axios.post(
-        `${import.meta.env.VITE_BACKEND_URL || 
-          'http://localhost:3000'}/api/lint`,
+        `${import.meta.env.VITE_BACKEND_URL ||
+        'http://localhost:3000'}/api/lint`,
         { code, language: lang }
       );
 
@@ -366,9 +381,111 @@ export default function App() {
     }, 500);
   };
 
+  const generateRoomId = () =>
+    Math.random().toString(36).substring(2, 8).toUpperCase();
+
+  const startCollaboration = (existingRoomId = null) => {
+    // Cleanup any existing session
+    if (monacoBindingRef.current) {
+      monacoBindingRef.current.destroy();
+      monacoBindingRef.current = null;
+    }
+    if (yjsProviderRef.current) {
+      yjsProviderRef.current.destroy();
+      yjsProviderRef.current = null;
+    }
+    if (ydocRef.current) {
+      ydocRef.current.destroy();
+      ydocRef.current = null;
+    }
+
+    const room = existingRoomId || generateRoomId();
+    setRoomId(room);
+
+    // Yjs document
+    const ydoc = new Y.Doc();
+    ydocRef.current = ydoc;
+
+    // Connect to backend /collab with room param
+    const collabWsUrl = `${WS_URL}/collab?room=${room}`;
+    const provider = new WebsocketProvider(
+      collabWsUrl,
+      room,
+      ydoc
+    );
+    yjsProviderRef.current = provider;
+
+    // Cursor color + username
+    const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'];
+    const color = colors[Math.floor(Math.random() * colors.length)];
+    provider.awareness.setLocalStateField('user', {
+      name: `User-${room.slice(0, 3)}`,
+      color,
+      colorLight: color + '40'
+    });
+
+    // Track online users
+    provider.awareness.on('change', () => {
+      setCollabUsers(provider.awareness.getStates().size);
+    });
+
+    // MonacoBinding — editor must be mounted
+    // editorRef.current check zaroori hai
+    if (editorRef.current && monacoRef.current) {
+      const ytext = ydoc.getText('monaco');
+      const binding = new MonacoBinding(
+        ytext,
+        editorRef.current.getModel(),
+        new Set([editorRef.current]),
+        provider.awareness
+      );
+      monacoBindingRef.current = binding;
+    }
+
+    provider.on('status', ({ status }) => {
+      if (status === 'connected') {
+        setCollabEnabled(true);
+        setCollabStatus('connected');
+      }
+    });
+
+    provider.on('connection-error', () => {
+      setCollabStatus('disconnected');
+    });
+
+    setCollabEnabled(true);
+    return room;
+  };
+
+  const stopCollaboration = () => {
+    if (monacoBindingRef.current) {
+      monacoBindingRef.current.destroy();
+      monacoBindingRef.current = null;
+    }
+    if (yjsProviderRef.current) {
+      yjsProviderRef.current.destroy();
+      yjsProviderRef.current = null;
+    }
+    if (ydocRef.current) {
+      ydocRef.current.destroy();
+      ydocRef.current = null;
+    }
+    setCollabEnabled(false);
+    setRoomId('');
+    setCollabUsers(0);
+    setCollabStatus('disconnected');
+  };
+
+  const joinRoom = () => {
+    const input = prompt('Enter Room ID:');
+    if (input && input.trim()) {
+      startCollaboration(input.trim().toUpperCase());
+    }
+  };
+
   return (
     <div className="app-container" style={{ display: 'flex', flexDirection: 'column', height: '100vh', backgroundColor: 'var(--bg-app)' }}>
-      
+
       {/* 1. HEADER */}
       <header style={{
         height: 'var(--header-height)',
@@ -394,9 +511,9 @@ export default function App() {
             marginLeft: '8px',
             fontWeight: 500
           }}>Day 2 Execution</span>
-          
-          <select 
-            value={language} 
+
+          <select
+            value={language}
             onChange={(e) => handleLanguageChange(e.target.value)}
             style={{
               backgroundColor: '#1e2433',
@@ -417,13 +534,13 @@ export default function App() {
 
         {/* Dynamic Service Status Indicators */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-          
+
           {/* API Health */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
             <span style={{ color: 'var(--text-secondary)' }}>REST API:</span>
             <span className={`status-indicator ${apiStatus}`}></span>
-            <span style={{ 
-              fontWeight: 500, 
+            <span style={{
+              fontWeight: 500,
               color: apiStatus === 'connected' ? 'var(--text-active)' : 'var(--text-secondary)',
               fontSize: '12px'
             }}>
@@ -435,8 +552,8 @@ export default function App() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
             <span style={{ color: 'var(--text-secondary)' }}>Terminal WS:</span>
             <span className={`status-indicator ${terminalStatus}`}></span>
-            <span style={{ 
-              fontWeight: 500, 
+            <span style={{
+              fontWeight: 500,
               color: terminalStatus === 'connected' ? 'var(--text-active)' : 'var(--text-secondary)',
               fontSize: '12px'
             }}>
@@ -448,8 +565,8 @@ export default function App() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
             <span style={{ color: 'var(--text-secondary)' }}>Collab WS:</span>
             <span className={`status-indicator ${collabStatus}`}></span>
-            <span style={{ 
-              fontWeight: 500, 
+            <span style={{
+              fontWeight: 500,
               color: collabStatus === 'connected' ? 'var(--text-active)' : 'var(--text-secondary)',
               fontSize: '12px'
             }}>
@@ -458,7 +575,7 @@ export default function App() {
           </div>
 
           {/* Reconnect button */}
-          <button 
+          <button
             onClick={reconnectAll}
             style={{
               backgroundColor: 'transparent',
@@ -483,9 +600,99 @@ export default function App() {
         </div>
       </header>
 
+      {/* Collab Control Bar */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        padding: '5px 12px',
+        backgroundColor: '#0d0f15',
+        borderBottom: '1px solid #1e2433',
+        fontSize: '12px',
+        flexShrink: 0
+      }}>
+        {!collabEnabled ? (
+          <>
+            <span style={{ color: '#475569', fontSize: '11px' }}>
+              Collaboration:
+            </span>
+            <button
+              onClick={() => startCollaboration()}
+              style={{
+                background: '#6366f1',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '3px 10px',
+                cursor: 'pointer',
+                fontSize: '11px'
+              }}>
+              🔗 Start Session
+            </button>
+            <button
+              onClick={joinRoom}
+              style={{
+                background: 'transparent',
+                color: '#cbd5e1',
+                border: '1px solid #3b82f6',
+                borderRadius: '4px',
+                padding: '3px 10px',
+                cursor: 'pointer',
+                fontSize: '11px'
+              }}>
+              Join Room
+            </button>
+          </>
+        ) : (
+          <>
+            <span style={{ color: '#10b981', fontSize: '11px' }}>
+              ● Live
+            </span>
+            <span style={{
+              color: '#6366f1',
+              fontFamily: 'Fira Code, monospace',
+              letterSpacing: '2px',
+              fontSize: '11px'
+            }}>
+              {roomId}
+            </span>
+            <button
+              onClick={() => navigator.clipboard.writeText(roomId)}
+              style={{
+                background: '#1e2433',
+                color: '#64748b',
+                border: 'none',
+                borderRadius: '3px',
+                padding: '2px 6px',
+                cursor: 'pointer',
+                fontSize: '10px'
+              }}>
+              Copy
+            </button>
+            <span style={{ color: '#64748b', fontSize: '11px' }}>
+              👥 {collabUsers}
+            </span>
+            <button
+              onClick={stopCollaboration}
+              style={{
+                background: '#ef4444',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '3px 8px',
+                cursor: 'pointer',
+                fontSize: '11px',
+                marginLeft: 'auto'
+              }}>
+              Stop
+            </button>
+          </>
+        )}
+      </div>
+
       {/* 2. MAIN CORE LAYOUT */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        
+
         {/* Left Toolbar (Sidebar) */}
         <div style={{
           width: 'var(--sidebar-width)',
@@ -499,7 +706,7 @@ export default function App() {
           userSelect: 'none'
         }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', alignItems: 'center', width: '100%' }}>
-            
+
             {/* Active Icon indicator */}
             <div style={{
               width: '100%',
@@ -512,24 +719,24 @@ export default function App() {
               <FolderTree size={22} />
             </div>
 
-            <div style={{ color: 'var(--text-secondary)', cursor: 'pointer', transition: 'color 0.2s' }} 
-                 onMouseEnter={(e) => e.currentTarget.style.color = 'var(--text-active)'}
-                 onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-secondary)'}
-                 title="Search">
+            <div style={{ color: 'var(--text-secondary)', cursor: 'pointer', transition: 'color 0.2s' }}
+              onMouseEnter={(e) => e.currentTarget.style.color = 'var(--text-active)'}
+              onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-secondary)'}
+              title="Search">
               <Search size={22} />
             </div>
 
             <div style={{ color: 'var(--text-secondary)', cursor: 'pointer', transition: 'color 0.2s' }}
-                 onMouseEnter={(e) => e.currentTarget.style.color = 'var(--text-active)'}
-                 onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-secondary)'}
-                 title="Collaboration Sync">
+              onMouseEnter={(e) => e.currentTarget.style.color = 'var(--text-active)'}
+              onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-secondary)'}
+              title="Collaboration Sync">
               <Users size={22} />
             </div>
 
             <div style={{ color: 'var(--text-secondary)', cursor: 'pointer', transition: 'color 0.2s' }}
-                 onMouseEnter={(e) => e.currentTarget.style.color = 'var(--text-active)'}
-                 onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-secondary)'}
-                 title="Layers & Infrastructure">
+              onMouseEnter={(e) => e.currentTarget.style.color = 'var(--text-active)'}
+              onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-secondary)'}
+              title="Layers & Infrastructure">
               <Layers size={22} />
             </div>
           </div>
@@ -546,19 +753,19 @@ export default function App() {
 
         {/* Workspace Split Layout */}
         <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-          
+
           {/* LEFT PANE: MONACO EDITOR */}
-          <div style={{ 
-            flex: 1, 
-            display: 'flex', 
-            flexDirection: 'column', 
+          <div style={{
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
             backgroundColor: 'var(--bg-editor)',
             borderRight: '1px solid var(--border-color)'
           }}>
             {/* Editor tab header */}
-            <div style={{ 
-              height: '35px', 
-              backgroundColor: 'var(--bg-sidebar)', 
+            <div style={{
+              height: '35px',
+              backgroundColor: 'var(--bg-sidebar)',
               borderBottom: '1px solid var(--border-color)',
               display: 'flex',
               alignItems: 'center',
@@ -579,7 +786,7 @@ export default function App() {
                 <span>{language === 'javascript' ? 'main.js' : 'main.py'}</span>
               </div>
             </div>
-            
+
             {/* Editor workspace */}
             <div style={{ flex: 1, paddingTop: '10px' }}>
               <Editor
@@ -601,55 +808,57 @@ export default function App() {
           </div>
 
           {/* RIGHT PANE: TERMINAL PANEL */}
-          <div style={{ 
-            width: '45%', 
-            display: 'flex', 
-            flexDirection: 'column', 
-            backgroundColor: 'var(--bg-panel)' 
+          <div style={{
+            width: '45%',
+            display: 'flex',
+            flexDirection: 'column',
+            backgroundColor: 'var(--bg-panel)'
           }}>
             <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-              
+
               {/* Tab bar */}
-              <div style={{ display: 'flex', alignItems: 'center', 
-                            borderBottom: '1px solid #1e2433',
-                            backgroundColor: '#07090c' }}>
-                
+              <div style={{
+                display: 'flex', alignItems: 'center',
+                borderBottom: '1px solid #1e2433',
+                backgroundColor: '#07090c'
+              }}>
+
                 {/* Main tabs: Terminal | Output */}
                 <button onClick={() => setRightTab('terminal')}
-                  style={{ 
+                  style={{
                     backgroundColor: 'transparent',
                     border: 'none',
                     padding: '8px 12px',
                     cursor: 'pointer',
                     fontWeight: rightTab === 'terminal' ? 'bold' : 'normal',
-                    color: rightTab==='terminal' ? '#6366f1' : '#64748b' 
+                    color: rightTab === 'terminal' ? '#6366f1' : '#64748b'
                   }}>
                   Terminal
                 </button>
                 <button onClick={() => setRightTab('output')}
-                  style={{ 
+                  style={{
                     backgroundColor: 'transparent',
                     border: 'none',
                     padding: '8px 12px',
                     cursor: 'pointer',
                     fontWeight: rightTab === 'output' ? 'bold' : 'normal',
-                    color: rightTab==='output' ? '#6366f1' : '#64748b' 
+                    color: rightTab === 'output' ? '#6366f1' : '#64748b'
                   }}>
                   Output
                 </button>
                 <button onClick={() => setRightTab('problems')}
-                  style={{ 
+                  style={{
                     backgroundColor: 'transparent',
                     border: 'none',
                     padding: '8px 12px',
                     cursor: 'pointer',
                     fontWeight: rightTab === 'problems' ? 'bold' : 'normal',
-                    color: rightTab==='problems' ? '#6366f1' : '#64748b'
+                    color: rightTab === 'problems' ? '#6366f1' : '#64748b'
                   }}>
-                  Problems {diagnostics.length > 0 
+                  Problems {diagnostics.length > 0
                     ? `(${diagnostics.length})` : ''}
                 </button>
-                
+
                 {/* Terminal instance tabs (only when Terminal tab active) */}
                 {rightTab === 'terminal' && (
                   <>
@@ -674,24 +883,24 @@ export default function App() {
                     <button
                       onClick={addTerminal}
                       title="New Terminal"
-                      style={{ 
+                      style={{
                         backgroundColor: 'transparent',
                         border: 'none',
                         cursor: 'pointer',
-                        color: '#6366f1', 
+                        color: '#6366f1',
                         fontWeight: 'bold',
-                        padding: '2px 8px' 
+                        padding: '2px 8px'
                       }}>
                       +
                     </button>
                   </>
                 )}
-                
+
                 {/* Run Code button — right side */}
                 <button
                   onClick={handleRunCode}
                   disabled={isRunning}
-                  style={{ 
+                  style={{
                     marginLeft: 'auto',
                     backgroundColor: '#10b981',
                     color: 'white',
@@ -709,10 +918,10 @@ export default function App() {
               </div>
 
               {/* Terminal containers — ALL mounted, toggle visibility */}
-              <div style={{ 
-                flex: 1, 
+              <div style={{
+                flex: 1,
                 display: rightTab === 'terminal' ? 'block' : 'none',
-                position: 'relative' 
+                position: 'relative'
               }}>
                 {terminals.map(term => (
                   <div
@@ -775,9 +984,8 @@ export default function App() {
                           borderRadius: '4px',
                           cursor: 'pointer',
                           backgroundColor: 'rgba(255,255,255,0.03)',
-                          borderLeft: `3px solid ${
-                            d.severity === 2 ? '#ef4444' : '#f59e0b'
-                          }`
+                          borderLeft: `3px solid ${d.severity === 2 ? '#ef4444' : '#f59e0b'
+                            }`
                         }}
                       >
                         <span style={{
