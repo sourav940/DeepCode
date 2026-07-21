@@ -307,6 +307,7 @@ const activeTerminalSessions = {};
 
 const wssTerminal = new ws.Server({ noServer: true });
 const wssYjs = new ws.Server({ noServer: true });
+const wssStatus = new ws.Server({ noServer: true });
 
 // Set up Terminal socket event handlers
 wssTerminal.on('connection', (ws, request) => {
@@ -437,6 +438,12 @@ wssYjs.on('connection', (ws, request) => {
   }
 });
 
+// Set up Status socket event handlers
+wssStatus.on('connection', (ws, request) => {
+  console.log(`[Status] Client connected to legacy status`);
+  ws.send('Legacy Status connection established');
+});
+
 // Implement path-based protocol upgrades
 server.on('upgrade', (request, socket, head) => {
   const { pathname } = url.parse(request.url);
@@ -448,6 +455,10 @@ server.on('upgrade', (request, socket, head) => {
   } else if (pathname === '/collab') {
     wssYjs.handleUpgrade(request, socket, head, (wsConnection) => {
       wssYjs.emit('connection', wsConnection, request);
+    });
+  } else if (pathname === '/status') {
+    wssStatus.handleUpgrade(request, socket, head, (wsConnection) => {
+      wssStatus.emit('connection', wsConnection, request);
     });
   } else {
     // Other upgrades (like socket.io) are left to be handled by their own listeners
