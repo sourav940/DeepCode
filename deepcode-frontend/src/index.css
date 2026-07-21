@@ -141,3 +141,39 @@ body, html, #root {
   transform: translate(-50%, -50%) scale(1);
   transition: transform 0s;
 }
+
+/* Yjs Monaco Collaboration Cursor Styles */
+.yRemoteSelection {
+  opacity: 0.5;
+}
+
+.yRemoteSelectionHead {
+  position: absolute;
+  border-left: 2px solid;
+  border-top: 2px solid;
+  border-bottom: 2px solid;
+  height: 100%;
+  box-sizing: border-box;
+  z-index: 10;
+  cursor: default;
+}
+
+.yRemoteSelectionHead::after {
+  position: absolute;
+  left: -2px;
+  top: -22px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: #fff;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.2s ease-in-out;
+  pointer-events: none;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.yRemoteSelectionHead:hover::after {
+  opacity: 1;
+}
