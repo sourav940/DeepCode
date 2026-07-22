@@ -291,10 +291,49 @@ const io = new SocketIoServer(server, {
 });
 
 // Handle socket.io connection logic
+const rooms = {};
+
 io.on('connection', (socket) => {
   console.log(`[Socket.io] WebRTC signaling connection established: ${socket.id}`);
+
+  socket.on('join-room', ({ roomId, userId }) => {
+    if (!rooms[roomId]) {
+      rooms[roomId] = [];
+    }
+    const peers = rooms[roomId];
+    
+    // Store roomId on socket for disconnect handling
+    socket.roomId = roomId;
+    socket.join(roomId);
+
+    // Inform the new user about existing peers
+    socket.emit('existing-peers', { peers });
+
+    // Add user to the room array
+    rooms[roomId].push(userId);
+
+    // Inform others that this user joined
+    socket.to(roomId).emit('user-joined', { socketId: userId });
+  });
+
+  socket.on('sending-signal', ({ userToSignal, callerId, signal }) => {
+    io.to(userToSignal).emit('user-joined-signal', { signal, callerId });
+  });
+
+  socket.on('returning-signal', ({ callerId, signal }) => {
+    io.to(callerId).emit('receiving-returned-signal', { signal, id: socket.id });
+  });
+
   socket.on('disconnect', () => {
     console.log(`[Socket.io] WebRTC signaling disconnected: ${socket.id}`);
+    const roomId = socket.roomId;
+    if (roomId && rooms[roomId]) {
+      rooms[roomId] = rooms[roomId].filter(id => id !== socket.id);
+      if (rooms[roomId].length === 0) {
+        delete rooms[roomId];
+      }
+      socket.to(roomId).emit('user-disconnected', { socketId: socket.id });
+    }
   });
 });
 
