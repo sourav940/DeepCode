@@ -22,6 +22,8 @@ import 'xterm/css/xterm.css';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { MonacoBinding } from 'y-monaco';
+import Peer from 'simple-peer';
+import { io } from 'socket.io-client';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
 
@@ -82,6 +84,15 @@ export default function App() {
   const yjsProviderRef = useRef(null);
   const monacoBindingRef = useRef(null);
 
+  const [isVoiceConnected, setIsVoiceConnected] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [voiceError, setVoiceError] = useState('');
+
+  const socketRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const peersRef = useRef({});
+  const remoteAudioRef = useRef(null);
+
   useEffect(() => {
     activeLangRef.current = language;
   }, [language]);
@@ -109,8 +120,149 @@ export default function App() {
       if (monacoBindingRef.current) monacoBindingRef.current.destroy();
       if (yjsProviderRef.current) yjsProviderRef.current.destroy();
       if (ydocRef.current) ydocRef.current.destroy();
+
+      if (socketRef.current) socketRef.current.disconnect();
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(t => t.stop());
+      }
+      Object.values(peersRef.current).forEach(p => p.destroy());
     };
   }, []);
+
+  const createPeer = (targetId, callerId, stream, socket, initiator) => {
+    const peer = new Peer({
+      initiator,
+      trickle: false,
+      stream
+    });
+
+    peer.on('signal', signal => {
+      if (initiator) {
+        socket.emit('sending-signal', {
+          userToSignal: targetId,
+          callerId,
+          signal
+        });
+      } else {
+        socket.emit('returning-signal', {
+          callerId: targetId,
+          signal
+        });
+      }
+    });
+
+    peer.on('stream', remoteStream => {
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = remoteStream;
+        remoteAudioRef.current.play().catch(e => {
+          console.error('[Voice] Autoplay blocked:', e);
+        });
+      }
+    });
+
+    peer.on('error', err => console.error('[Voice] Peer error:', err));
+    peer.on('close', () => console.log('[Voice] Peer connection closed'));
+
+    return peer;
+  };
+
+  const startVoiceCall = async () => {
+    if (!collabEnabled || !roomId) {
+      setVoiceError('Start collaboration first');
+      setTimeout(() => setVoiceError(''), 3000);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      localStreamRef.current = stream;
+
+      socketRef.current = io(BACKEND_URL, {
+        path: '/socket.io',
+        transports: ['websocket']
+      });
+
+      const socket = socketRef.current;
+
+      socket.emit('join-room', {
+        roomId: roomId,
+        userId: socket.id
+      });
+
+      socket.on('existing-peers', ({ peers }) => {
+        peers.forEach(peerId => {
+          const peer = createPeer(peerId, socket.id, stream, socket, false);
+          peersRef.current[peerId] = peer;
+        });
+      });
+
+      socket.on('user-joined', ({ socketId }) => {
+        const peer = createPeer(socketId, socket.id, stream, socket, true);
+        peersRef.current[socketId] = peer;
+      });
+
+      socket.on('user-joined-signal', ({ signal, callerId }) => {
+        const peer = peersRef.current[callerId];
+        if (peer) {
+          peer.signal(signal);
+        }
+      });
+
+      socket.on('receiving-returned-signal', ({ signal, id }) => {
+        const peer = peersRef.current[id];
+        if (peer) {
+          peer.signal(signal);
+        }
+      });
+
+      socket.on('user-disconnected', ({ socketId }) => {
+        if (peersRef.current[socketId]) {
+          peersRef.current[socketId].destroy();
+          delete peersRef.current[socketId];
+        }
+      });
+
+      setIsVoiceConnected(true);
+      setVoiceError('');
+    } catch (err) {
+      setVoiceError('Microphone access denied');
+      setTimeout(() => setVoiceError(''), 3000);
+      console.error('[Voice] Error:', err);
+    }
+  };
+
+  const stopVoiceCall = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+
+    Object.values(peersRef.current).forEach(peer => peer.destroy());
+    peersRef.current = {};
+
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = null;
+    }
+
+    setIsVoiceConnected(false);
+    setIsMuted(false);
+    setVoiceError('');
+  };
+
+  const toggleMute = () => {
+    if (localStreamRef.current) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        setIsMuted(!audioTrack.enabled);
+      }
+    }
+  };
 
   const checkHealth = async () => {
     setApiStatus('connecting');
@@ -686,9 +838,62 @@ export default function App() {
               }}>
               Stop
             </button>
+            
+            {/* Voice controls */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              marginLeft: '8px',
+              paddingLeft: '8px',
+              borderLeft: '1px solid #1e2433'
+            }}>
+              <button
+                onClick={isVoiceConnected ? stopVoiceCall : startVoiceCall}
+                style={{
+                  background: isVoiceConnected ? '#ef4444' : '#10b981',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  padding: '3px 10px',
+                  cursor: 'pointer',
+                  fontSize: '11px'
+                }}>
+                {isVoiceConnected ? '📵 Leave Voice' : '🎙️ Join Voice'}
+              </button>
+
+              {isVoiceConnected && (
+                <button
+                  onClick={toggleMute}
+                  style={{
+                    background: isMuted ? '#f59e0b' : '#1e2433',
+                    color: isMuted ? 'black' : '#cbd5e1',
+                    border: '1px solid #3b82f6',
+                    borderRadius: '4px',
+                    padding: '3px 8px',
+                    cursor: 'pointer',
+                    fontSize: '11px'
+                  }}>
+                  {isMuted ? '🔇 Unmute' : '🎤 Mute'}
+                </button>
+              )}
+
+              {voiceError && (
+                <span style={{ color: '#ef4444', fontSize: '10px' }}>
+                  {voiceError}
+                </span>
+              )}
+            </div>
           </>
         )}
       </div>
+
+      {/* Hidden audio element for remote stream */}
+      <audio
+        ref={remoteAudioRef}
+        autoPlay
+        style={{ display: 'none' }}
+      />
 
       {/* 2. MAIN CORE LAYOUT */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
