@@ -291,49 +291,56 @@ const io = new SocketIoServer(server, {
 });
 
 // Handle socket.io connection logic
-const rooms = {};
-
 io.on('connection', (socket) => {
-  console.log(`[Socket.io] WebRTC signaling connection established: ${socket.id}`);
+  console.log(`[Socket.io] Peer connected: ${socket.id}`);
 
+  // Event 1: User joins a WebRTC room
   socket.on('join-room', ({ roomId, userId }) => {
-    if (!rooms[roomId]) {
-      rooms[roomId] = [];
-    }
-    const peers = rooms[roomId];
-    
-    // Store roomId on socket for disconnect handling
-    socket.roomId = roomId;
     socket.join(roomId);
+    console.log(`[WebRTC] ${userId} joined room: ${roomId}`);
 
-    // Inform the new user about existing peers
-    socket.emit('existing-peers', { peers });
+    // Tell existing room members about new peer
+    socket.to(roomId).emit('user-joined', {
+      socketId: socket.id,
+      userId
+    });
 
-    // Add user to the room array
-    rooms[roomId].push(userId);
+    // Send new peer the list of existing peers in room
+    const roomSockets = io.sockets.adapter.rooms.get(roomId);
+    const existingPeers = roomSockets
+      ? [...roomSockets].filter(id => id !== socket.id)
+      : [];
 
-    // Inform others that this user joined
-    socket.to(roomId).emit('user-joined', { socketId: userId });
+    socket.emit('existing-peers', { peers: existingPeers });
   });
 
+  // Event 2: Relay WebRTC offer/ICE to target peer
   socket.on('sending-signal', ({ userToSignal, callerId, signal }) => {
-    io.to(userToSignal).emit('user-joined-signal', { signal, callerId });
+    io.to(userToSignal).emit('user-joined-signal', {
+      signal,
+      callerId
+    });
+    console.log(`[WebRTC] Signal: ${callerId} → ${userToSignal}`);
   });
 
+  // Event 3: Relay WebRTC answer back to caller
   socket.on('returning-signal', ({ callerId, signal }) => {
-    io.to(callerId).emit('receiving-returned-signal', { signal, id: socket.id });
+    io.to(callerId).emit('receiving-returned-signal', {
+      signal,
+      id: socket.id
+    });
+    console.log(`[WebRTC] Answer: ${socket.id} → ${callerId}`);
   });
 
+  // Event 4: Cleanup on disconnect
   socket.on('disconnect', () => {
-    console.log(`[Socket.io] WebRTC signaling disconnected: ${socket.id}`);
-    const roomId = socket.roomId;
-    if (roomId && rooms[roomId]) {
-      rooms[roomId] = rooms[roomId].filter(id => id !== socket.id);
-      if (rooms[roomId].length === 0) {
-        delete rooms[roomId];
-      }
-      socket.to(roomId).emit('user-disconnected', { socketId: socket.id });
-    }
+    console.log(`[Socket.io] Peer disconnected: ${socket.id}`);
+    // Broadcast to all rooms this socket was in
+    socket.rooms.forEach(roomId => {
+      socket.to(roomId).emit('user-disconnected', {
+        socketId: socket.id
+      });
+    });
   });
 });
 
