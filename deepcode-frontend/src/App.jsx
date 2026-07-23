@@ -654,15 +654,6 @@ export default function App() {
           <span style={{ fontWeight: 700, fontSize: '15px', letterSpacing: '0.5px' }}>
             DeepCode <span style={{ fontWeight: 300, color: 'var(--text-secondary)' }}>Cloud IDE</span>
           </span>
-          <span style={{
-            fontSize: '11px',
-            backgroundColor: 'var(--border-color)',
-            color: 'var(--text-secondary)',
-            padding: '2px 6px',
-            borderRadius: '4px',
-            marginLeft: '8px',
-            fontWeight: 500
-          }}>Day 2 Execution</span>
 
           <select
             value={language}
